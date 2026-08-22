@@ -20,6 +20,7 @@ export const Route = createFileRoute("/api/investigate")({
         const goal = typeof raw["goal"] === "string" ? raw["goal"].trim() : "";
         const target = typeof raw["target"] === "string" ? raw["target"].trim() : "";
         const topic = typeof raw["topic"] === "string" ? raw["topic"].trim() : "";
+        const adversarial = raw["adversarial"] === true;
         const competitors = Array.isArray(raw["competitors"])
           ? raw["competitors"].filter((c): c is string => typeof c === "string")
           : [];
@@ -46,6 +47,7 @@ export const Route = createFileRoute("/api/investigate")({
                 target,
                 topic,
                 competitors,
+                adversarial,
               })) {
                 send(chunk);
               }

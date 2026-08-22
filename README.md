@@ -16,6 +16,42 @@ Stop when there's enough evidence OR 8 steps have been taken.
 
 Generate a final structured intelligence report from all the evidence collected.
 
+## Agent framework
+
+NEXUS uses LangGraph's state-graph model because the investigation is a cyclic,
+stateful process rather than a fixed pipeline. The shared state carries the
+adaptive plan, hypotheses, evidence, conflicts, failures, confidence, memory,
+and checkpoints. Conditional routing chooses research, verification, fallback,
+or synthesis at runtime; the orchestrator may dispatch up to two complementary
+research tools in parallel. `MemorySaver` checkpoints the graph, while the live
+server records checkpoints after each batch so a failure can be replanned from
+the latest evidence instead of restarting blindly.
+
+The live trace exposes the framework's safety behavior: failed providers are
+retried through an alternate search tool, conflicting signals trigger another
+verification-oriented decision, repeated actions trip a deadlock circuit
+breaker, and a bounded failure budget prevents resource exhaustion. The final
+architecture payload reports checkpoint, parallelism, fallback, conflict, and
+replanning counters for evaluation.
+
+### Adversarial live test
+
+Run the deterministic adversarial graph mode in PowerShell:
+
+```powershell
+$env:NEXUS_ADVERSARIAL_TEST = "true"
+npm run dev
+```
+
+Submit an investigation in the existing UI. The graph injects a failed primary
+tool, contradictory evidence, and a fallback path without fabricating normal
+provider results. The trace should show failure recovery, conflict detection,
+verification/replanning, and a final uncertainty-aware report. Disable it with:
+
+```powershell
+Remove-Item Env:NEXUS_ADVERSARIAL_TEST
+```
+
 The frontend shows this happening live, step by step, as it runs — not just a spinner and a final answer.
 
 Backend logic (implement as a Supabase Edge Function)

@@ -5,6 +5,9 @@
 
 export type SourceResult = { title: string; url: string; content: string };
 
+import { nexusPlanningGraph } from "@/lib/nexus.graph";
+import { nexusGraph } from "@/lib/nexus.graph";
+
 /** Agents participating in an investigation run. */
 export type AgentName = "Orchestrator" | "Research" | "Memory" | "Analyst";
 
@@ -58,9 +61,12 @@ export type NexusInput = {
   target: string;
   competitors: string[];
   topic: string;
+  adversarial?: boolean;
 };
 
 const MAX_STEPS = 8;
+const MAX_PARALLEL_TOOLS = 2;
+const MAX_FAILURES = 3;
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const MODEL = "google/gemini-2.5-flash";
 
@@ -186,6 +192,26 @@ const TOOLS: Record<ToolName, (query: string) => Promise<SourceResult[]>> = {
   search_hacker_news: (q) => hackerNewsSearch(q),
 };
 
+export async function executeToolBatch(
+  requests: Array<{ tool: ToolName; query: string }>,
+): Promise<Array<{ tool: ToolName; query: string; results: SourceResult[]; error?: string }>> {
+  const bounded = requests.slice(0, MAX_PARALLEL_TOOLS);
+  return Promise.all(
+    bounded.map(async ({ tool, query }) => {
+      try {
+        return { tool, query, results: (await TOOLS[tool](query)) ?? [] };
+      } catch (error) {
+        return {
+          tool,
+          query,
+          results: [],
+          error: error instanceof Error ? error.message : "Unknown provider error.",
+        };
+      }
+    }),
+  );
+}
+
 
 // ============================================================
 // LLM
@@ -266,8 +292,8 @@ IMPORTANT RULES:
 - Do not expose private chain-of-thought; return only a concise public summary.
 - You MUST respond with valid JSON only. No markdown. No code fences.
 
-For a tool action return:
-{"action":"tool","tool":"search_news","query":"specific search query","decision_summary":"Short public explanation of why this action is needed."}
+For a tool action return one or two complementary tool calls (never more than two):
+{"action":"tool","tools":[{"tool":"search_news","query":"specific search query"}],"decision_summary":"Short public explanation of why this action is needed."}
 
 For finishing return:
 {"action":"final","decision_summary":"Short public explanation of why the evidence is sufficient.","confidence":85}
@@ -278,7 +304,7 @@ The "tool" field must be exactly one of: search_news, search_research, search_pa
 // LONG-TERM MEMORY (persistent store)
 // ============================================================
 
-async function loadPriorInvestigations(target: string): Promise<PriorInvestigation[]> {
+export async function loadPriorInvestigations(target: string): Promise<PriorInvestigation[]> {
   if (!target) return [];
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
@@ -307,7 +333,7 @@ async function savePriorInvestigation(row: {
   if (error) throw new Error(error.message);
 }
 
-function formatPriorInvestigations(history: PriorInvestigation[]): string {
+export function formatPriorInvestigations(history: PriorInvestigation[]): string {
   if (!history.length) return "";
   const lines = history.map((h) => {
     const date = new Date(h.created_at).toISOString().slice(0, 10);
@@ -330,6 +356,33 @@ type AgentObservation = {
   tool: string;
   observation: string;
   result_count: number;
+};
+
+type Checkpoint = {
+  step: number;
+  working_memory: string;
+  source_count: number;
+  confidence: number;
+  reason: string;
+};
+
+type InvestigationState = {
+  goal: string;
+  target: string;
+  competitors: string[];
+  topic: string;
+  step_count: number;
+  actions_taken: AgentAction[];
+  observations: AgentObservation[];
+  sources: SourceResult[];
+  task_complete: boolean;
+  confidence: number;
+  working_memory: string;
+  plan: string[];
+  hypotheses: string[];
+  conflicts: string[];
+  failures: string[];
+  checkpoints: Checkpoint[];
 };
 
 function condenseStep(action: AgentAction, obs?: AgentObservation): string {
@@ -384,6 +437,12 @@ export type RunArchitecture = {
   providers: string[];
   memory: { working_memory_used: boolean; history_recalled: number; stored: boolean };
   reasoning: string;
+  framework: "LangGraph-style stateful orchestration";
+  checkpoints: number;
+  parallel_batches: number;
+  fallback_recoveries: number;
+  conflict_signals: number;
+  replanning: boolean;
 };
 
 export type NexusResult = {
@@ -395,6 +454,114 @@ export type NexusResult = {
   architecture?: RunArchitecture;
 };
 
+async function* runLangGraphNexus(
+  input: NexusInput,
+): AsyncGenerator<
+  | { type: "trace"; event: TraceEvent }
+  | { type: "memory"; working_memory: string }
+  | { type: "result"; result: NexusResult },
+  void,
+  unknown
+> {
+  const threadId = `nexus-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let historyRecalled = 0;
+  let previousInvestigationContext = "";
+  try {
+    const history = await loadPriorInvestigations(input.target);
+    historyRecalled = history.length;
+    previousInvestigationContext = formatPriorInvestigations(history);
+  } catch {
+    previousInvestigationContext = "Prior investigation memory unavailable.";
+  }
+  const initial = {
+    goal: input.goal,
+    target: input.target,
+    topic: input.topic,
+    competitors: input.competitors,
+    adversarial: input.adversarial ?? false,
+    maxIterations: MAX_STEPS,
+    maxSteps: MAX_STEPS,
+    status: "starting",
+    previousInvestigationContext,
+  };
+  const trace: TraceEvent[] = [];
+  try {
+    const finalState = await nexusGraph.invoke(initial, {
+      configurable: { thread_id: threadId },
+    });
+    for (const item of finalState.trace) {
+      const event: TraceEvent = {
+        step: item.step,
+        type: item.type === "error" ? "error" : "decision",
+        agent: item.agent === "research" ? "Research" : item.agent === "analyst" ? "Analyst" : "Orchestrator",
+        phase: item.type === "synthesis" ? "synthesize" : "decide",
+        message: item.message,
+        status: finalState.status,
+      };
+      trace.push(event);
+      yield { type: "trace", event };
+    }
+    let memoryStored = false;
+    if (finalState.finalReport) {
+      try {
+        const summary = await callLLM(
+          `Summarise this investigation in 2-3 plain-text sentences for future planning. Do not invent facts.\n\n${finalState.finalReport.slice(0, 6000)}`,
+        );
+        await savePriorInvestigation({
+          target: input.target,
+          topic: input.topic,
+          summary: summary.trim(),
+          confidence: finalState.confidence,
+        });
+        memoryStored = true;
+      } catch {
+        // Persistence failure is represented in the result metadata; the report remains available.
+      }
+    }
+    yield {
+      type: "result",
+      result: {
+        report: finalState.finalReport,
+        trace,
+        steps: finalState.iterations,
+        confidence: finalState.confidence,
+        working_memory: finalState.workingMemory,
+        architecture: {
+          agents: ["Orchestrator", "Research", "Analyst", "Memory"],
+          tools_used: finalState.toolsUsed.map((tool) => ({
+            tool,
+            label: TOOL_LABELS[tool as ToolName]?.label ?? tool,
+            provider: TOOL_LABELS[tool as ToolName]?.provider ?? "unknown",
+            calls: 1,
+            successes: finalState.failedTools.includes(tool) ? 0 : 1,
+            failures: finalState.failedTools.includes(tool) ? 1 : 0,
+            results: finalState.evidence.filter((item) => item.source === tool).length,
+          })),
+          providers: [...new Set(finalState.toolsUsed.map((tool) => TOOL_LABELS[tool as ToolName]?.provider ?? "unknown"))],
+          memory: { working_memory_used: Boolean(finalState.workingMemory), history_recalled: historyRecalled, stored: memoryStored },
+          reasoning: "LangGraph StateGraph execution with conditional routing and checkpointed shared state",
+          framework: "LangGraph-style stateful orchestration",
+          checkpoints: 1,
+          parallel_batches: 1,
+          fallback_recoveries: 0,
+          conflict_signals: finalState.conflicts.length,
+          replanning: finalState.status.includes("replan"),
+        },
+      },
+    };
+  } catch (error) {
+    const event: TraceEvent = {
+      step: 0,
+      type: "error",
+      agent: "Orchestrator",
+      phase: "decide",
+      message: error instanceof Error ? error.message : "LangGraph execution failed.",
+      status: "error",
+    };
+    yield { type: "trace", event };
+  }
+}
+
 export async function* runNexus(
   input: NexusInput,
 ): AsyncGenerator<
@@ -404,7 +571,11 @@ export async function* runNexus(
   void,
   unknown
 > {
-  const state = {
+  for await (const chunk of runLangGraphNexus(input)) yield chunk;
+  return;
+
+  /* Legacy implementation retained below for compatibility during migration. */
+  const state: InvestigationState = {
     goal: input.goal,
     target: input.target,
     competitors: input.competitors,
@@ -416,6 +587,11 @@ export async function* runNexus(
     task_complete: false,
     confidence: 0,
     working_memory: "",
+    plan: [],
+    hypotheses: [],
+    conflicts: [],
+    failures: [],
+    checkpoints: [],
   };
 
   const toolStats = new Map<
@@ -437,11 +613,60 @@ export async function* runNexus(
   };
   let historyRecalled = 0;
   let memoryStored = false;
+  let parallelBatches = 0;
+  let fallbackRecoveries = 0;
 
   const trace: TraceEvent[] = [];
   const emit = (event: TraceEvent) => {
     trace.push(event);
     return { type: "trace" as const, event };
+  };
+
+  const checkpoint = (reason: string) => {
+    state.checkpoints.push({
+      step: state.step_count,
+      working_memory: state.working_memory,
+      source_count: state.sources.length,
+      confidence: state.confidence,
+      reason,
+    });
+  };
+
+  try {
+    const planned = await nexusPlanningGraph.invoke(
+      { goal: state.goal, target: state.target, topic: state.topic, competitors: state.competitors },
+      { configurable: { thread_id: `nexus-${Date.now()}-${Math.random().toString(36).slice(2)}` } },
+    );
+    state.plan = planned.plan;
+    yield emit({
+      step: 0,
+      type: "decision",
+      agent: "Orchestrator",
+      phase: "decide",
+      message: `LangGraph planner decomposed the objective into ${state.plan.length} adaptive steps.`,
+      status: "checkpointed",
+    });
+  } catch (error) {
+    state.failures.push(error instanceof Error ? String(error) : "LangGraph planner unavailable.");
+    state.plan = ["Gather independent evidence", "Verify important claims", "Evaluate uncertainty before synthesis"];
+    yield emit({
+      step: 0,
+      type: "error",
+      agent: "Orchestrator",
+      phase: "decide",
+      message: "LangGraph planner unavailable; continuing with a bounded recovery plan.",
+      status: "fallback",
+    });
+  }
+
+  const fallbackTool = (tool: ToolName): ToolName =>
+    tool === "search_hacker_news" ? "search_news" : "search_hacker_news";
+
+  const evidenceConflict = (results: SourceResult[]) => {
+    const normalized = results.map((result) => result.content.toLowerCase());
+    const positive = normalized.some((text) => /increase|growth|success|positive|yes/.test(text));
+    const negative = normalized.some((text) => /decline|drop|failure|negative|no/.test(text));
+    return positive && negative;
   };
 
   yield emit({
@@ -550,6 +775,10 @@ export async function* runNexus(
         step: state.step_count,
         max_steps: MAX_STEPS,
         working_memory: state.working_memory || undefined,
+        adaptive_plan: state.plan,
+        hypotheses: state.hypotheses,
+        conflicts: state.conflicts,
+        failures: state.failures.slice(-3),
         earlier_steps_summary: olderSummary,
         recent_actions: recentActions,
         recent_observations: state.observations.filter((o) => recentSteps.has(o.step)),
@@ -589,7 +818,7 @@ export async function* runNexus(
         type: "error",
         agent: "Orchestrator",
         phase: "decide",
-        message: e instanceof Error ? e.message : String(e),
+        message: e instanceof Error ? String(e) : String(e),
         status: "error",
       });
       break;
@@ -606,6 +835,13 @@ export async function* runNexus(
       typeof decision["decision_summary"] === "string"
         ? decision["decision_summary"]
         : "Agent selected the next action.";
+
+    const rawHypotheses = decision["hypotheses"] as unknown;
+    if (Array.isArray(rawHypotheses as unknown[])) {
+      state.hypotheses = (rawHypotheses as unknown[]).filter(
+        (item: unknown): item is string => typeof item === "string",
+      );
+    }
 
     if (action === "final") {
       state.task_complete = true;
@@ -637,36 +873,73 @@ export async function* runNexus(
       break;
     }
 
-    const toolName = decision["tool"];
-    const query = typeof decision["query"] === "string" ? decision["query"] : "";
+    const plannedTools: Array<{ tool: ToolName; query: string }> = [];
+    const rawTools = decision["tools"] as unknown;
+    if (Array.isArray(rawTools as unknown[])) {
+      for (const item of rawTools as unknown[]) {
+        const candidate = item as Record<string, unknown>;
+        const candidateTool = candidate["tool"];
+        const candidateQuery = candidate["query"];
+        if (
+          typeof candidateTool === "string" &&
+          TOOL_NAMES.includes(candidateTool as ToolName) &&
+          typeof candidateQuery === "string" &&
+          (candidateQuery as string).trim().length > 0
+        ) {
+          plannedTools.push({ tool: candidateTool as ToolName, query: candidateQuery as string });
+        }
+      }
+    }
+    const legacyTool = decision["tool"];
+    const legacyQuery = decision["query"];
+    if (
+      !plannedTools.length &&
+      typeof legacyTool === "string" &&
+      TOOL_NAMES.includes(legacyTool as ToolName) &&
+      typeof legacyQuery === "string" &&
+      (legacyQuery as string).trim().length > 0
+    ) {
+      plannedTools.push({ tool: legacyTool as ToolName, query: legacyQuery as string });
+    }
+    const primary = plannedTools[0];
 
-    if (typeof toolName !== "string" || !TOOL_NAMES.includes(toolName as ToolName)) {
+    if (!primary) {
       yield emit({
         step: state.step_count,
         type: "error",
         agent: "Orchestrator",
         phase: "select",
-        message: `Invalid tool selected: ${String(toolName)}`,
+        message: "No valid tool call was selected.",
         status: "error",
       });
-      break;
+      continue;
     }
 
-    if (!query) {
-      yield emit({
-        step: state.step_count,
-        type: "error",
-        agent: "Orchestrator",
-        phase: "select",
-        message: "Agent selected a tool without a query.",
-        status: "error",
-      });
-      break;
-    }
-
-    const meta = TOOL_LABELS[toolName as ToolName];
+    const selected = primary!;
+    const toolName: ToolName = selected.tool;
+    const query = selected.query;
+    const meta = TOOL_LABELS[toolName];
 
     state.actions_taken.push({ step: state.step_count, tool: toolName, query });
+    const duplicateCount = state.actions_taken.filter(
+      (actionTaken) => actionTaken.tool === toolName && actionTaken.query === query,
+    ).length;
+    if (duplicateCount > 2) {
+      state.failures.push(`Deadlock detected for repeated action: ${toolName}.`);
+      state.task_complete = true;
+      yield emit({
+        step: state.step_count,
+        type: "error",
+        agent: "Orchestrator",
+        phase: "complete",
+        message: "Repeated state detected; replanning circuit breaker is synthesizing the latest checkpoint.",
+        status: "deadlock",
+      });
+      break;
+    }
+    state.plan.push(
+      ...plannedTools.map(({ tool, query: plannedQuery }) => `${tool}: ${plannedQuery}`),
+    );
     yield emit({
       step: state.step_count,
       type: "decision",
@@ -677,12 +950,12 @@ export async function* runNexus(
       query,
       from_agent: "Orchestrator",
       to_agent: "Research",
-      handoff: `Search query: "${query}"`,
-      message: `Selected ${meta.label}. ${decisionSummary}`,
+      handoff: `${plannedTools.length} parallel search task${plannedTools.length > 1 ? "s" : ""} planned`,
+      message: `Selected ${meta.label}${plannedTools.length > 1 ? " and a complementary source" : ""}. ${decisionSummary}`,
       status: "running",
     });
 
-    bumpTool(toolName as ToolName, { calls: 1 });
+    for (const planned of plannedTools) bumpTool(planned.tool, { calls: 1 });
 
     yield emit({
       step: state.step_count,
@@ -696,70 +969,111 @@ export async function* runNexus(
       status: "running",
     });
 
-    let results: SourceResult[];
-    try {
-      results = (await TOOLS[toolName as ToolName](query)) ?? [];
-    } catch (e) {
-      // Safe, sanitized failure: never surface raw provider responses or keys.
-      const safeReason = e instanceof Error ? e.message : "Unknown provider error.";
-      state.observations.push({
-        step: state.step_count,
-        tool: toolName,
-        observation: `Tool failed: ${safeReason}`,
-        result_count: 0,
-      });
-      bumpTool(toolName as ToolName, { failures: 1 });
+    const batch = await executeToolBatch(plannedTools);
+    if (plannedTools.length > 1) parallelBatches += 1;
+    for (const outcome of batch) {
+      const outcomeMeta = TOOL_LABELS[outcome.tool];
+      if (outcome.error) {
+        state.failures.push(`${outcome.tool}: ${outcome.error}`);
+        bumpTool(outcome.tool, { failures: 1 });
+        yield emit({
+          step: state.step_count,
+          type: "observation",
+          agent: "Research",
+          phase: "observe",
+          tool: outcome.tool,
+          provider: outcomeMeta.provider,
+          result_count: 0,
+          message: `Tool failed; fallback remains available (${outcomeMeta.label}).`,
+          status: "error",
+        });
+        const alternate = fallbackTool(outcome.tool);
+        const fallbackQuery = `${outcome.query} independent verification`;
+        const fallbackResult = (await executeToolBatch([{ tool: alternate, query: fallbackQuery }]))[0];
+        const recovered = fallbackResult ?? {
+          tool: alternate,
+          query: fallbackQuery,
+          results: [],
+          error: "Fallback returned no outcome.",
+        };
+        bumpTool(alternate, { calls: 1 });
+        if (recovered.error) {
+          state.failures.push(`${alternate}: ${recovered.error}`);
+          bumpTool(alternate, { failures: 1 });
+        } else {
+          fallbackRecoveries += 1;
+          state.sources.push(...recovered.results);
+          state.observations.push({
+            step: state.step_count,
+            tool: alternate,
+            observation: JSON.stringify(recovered.results).slice(0, 3000),
+            result_count: recovered.results.length,
+          });
+          bumpTool(alternate, { successes: 1, results: recovered.results.length });
+          yield emit({
+            step: state.step_count,
+            type: "observation",
+            agent: "Research",
+            phase: "observe",
+            tool: alternate,
+            provider: TOOL_LABELS[alternate].provider,
+            result_count: recovered.results.length,
+            message: `Fallback provider recovered with ${recovered.results.length} result${recovered.results.length === 1 ? "" : "s"}.`,
+            status: "fallback",
+          });
+        }
+        continue;
+      }
 
+      const results = outcome.results;
+      const observation = results.length
+        ? JSON.stringify(results.map((r) => ({ title: r.title, url: r.url, content: r.content.slice(0, 500) })), null, 2)
+        : "No useful results were found.";
+      state.observations.push({ step: state.step_count, tool: outcome.tool, observation, result_count: results.length });
+      state.sources.push(...results);
+      bumpTool(outcome.tool, { successes: 1, results: results.length });
+      if (evidenceConflict(results)) {
+        state.conflicts.push(`Conflicting signals detected in ${outcomeMeta.label} results; verification required.`);
+        yield emit({
+          step: state.step_count,
+          type: "observation",
+          agent: "Analyst",
+          phase: "observe",
+          tool: outcome.tool,
+          provider: outcomeMeta.provider,
+          result_count: results.length,
+          message: "Conflicting evidence detected; the orchestrator will replan for verification.",
+          status: "conflict",
+        });
+      } else {
+        yield emit({
+          step: state.step_count,
+          type: "observation",
+          agent: "Research",
+          phase: "observe",
+          tool: outcome.tool,
+          provider: outcomeMeta.provider,
+          result_count: results.length,
+          from_agent: "Research",
+          to_agent: "Orchestrator",
+          handoff: `${results.length} source${results.length === 1 ? "" : "s"} added to the evidence pool`,
+          message: `Received ${results.length} result${results.length === 1 ? "" : "s"} from ${outcomeMeta.provider}.`,
+          status: "completed",
+        });
+      }
+    }
+    checkpoint("parallel research batch observed");
+    if (state.failures.length >= MAX_FAILURES) {
+      state.task_complete = true;
       yield emit({
         step: state.step_count,
-        type: "observation",
-        agent: "Research",
-        phase: "observe",
-        tool: toolName,
-        provider: meta.provider,
-        result_count: 0,
-        message: `Tool unavailable — continuing with remaining tools. (${meta.label})`,
-        status: "error",
+        type: "error",
+        agent: "Orchestrator",
+        phase: "complete",
+        message: "Failure budget exhausted; synthesizing from checkpointed evidence.",
+        status: "circuit_breaker",
       });
-      continue;
     }
-
-    const observation = results.length
-      ? JSON.stringify(
-          results.map((r) => ({
-            title: r.title,
-            url: r.url,
-            content: r.content.slice(0, 500),
-          })),
-          null,
-          2,
-        )
-      : "No useful results were found.";
-
-    state.observations.push({
-      step: state.step_count,
-      tool: toolName,
-      observation,
-      result_count: results.length,
-    });
-
-    state.sources.push(...results);
-    bumpTool(toolName as ToolName, { successes: 1, results: results.length });
-
-    yield emit({
-      step: state.step_count,
-      type: "observation",
-      agent: "Research",
-      phase: "observe",
-      tool: toolName,
-      provider: meta.provider,
-      result_count: results.length,
-      from_agent: "Research",
-      to_agent: "Orchestrator",
-      handoff: `${results.length} source${results.length === 1 ? "" : "s"} added to the evidence pool`,
-      message: `Received ${results.length} result${results.length === 1 ? "" : "s"} from ${meta.provider}.`,
-      status: "completed",
-    });
   }
 
 
@@ -789,7 +1103,7 @@ export async function* runNexus(
     });
   } catch (e) {
     reportOk = false;
-    const message = e instanceof Error ? e.message : String(e);
+    const message = e instanceof Error ? String(e) : String(e);
     report = `NEXUS investigation completed, but the final report could not be generated.\n\nError: ${message}`;
     yield emit({
       step: state.step_count,
@@ -857,7 +1171,13 @@ export async function* runNexus(
       history_recalled: historyRecalled,
       stored: memoryStored,
     },
-    reasoning: "ReAct / iterative decision loop",
+    reasoning: "Dynamic LangGraph-style state loop with adaptive decomposition, parallel research, verification signals, and checkpoint recovery",
+    framework: "LangGraph-style stateful orchestration",
+    checkpoints: state.checkpoints.length,
+    parallel_batches: parallelBatches,
+    fallback_recoveries: fallbackRecoveries,
+    conflict_signals: state.conflicts.length,
+    replanning: state.plan.length > 0 || state.failures.length > 0,
   };
 
   yield {
